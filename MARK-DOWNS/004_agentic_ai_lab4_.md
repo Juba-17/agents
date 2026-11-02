@@ -1121,6 +1121,717 @@ for _ in range(5):
 6. Model output must never choose arbitrary code; validate arguments and sanitize pushed text.
 7. Every tool call needs a tool message with the matching id; `append` the assistant message, then `extend` the results.
 8. "Don't know → **record, then admit**" creates a feedback loop to improve the agent's knowledge.
+
+# Master Study Guide: The Visible Agent Loop (Code + Concepts)
+
+**Source:** `5_extra.ipynb` — "A More Visible Agent Loop"
+**Approach:** every code block from the notebook is included, in order. Each is explained by **what idea it implements and why it is designed that way**, not by Python syntax.
+
+> **Labels:** **[Notebook]** = taught by the notebook · **Additional Explanation** = background I added · **Textbook Insight** = standard AI/agent concept · **Research Connection** = named papers or frameworks.
+
+---
+
+## Table of Contents
+
+**Part A: Theory**
+1. [What the Notebook Teaches](#1-what-the-notebook-teaches)
+2. [LLMs Are Stateless](#2-llms-are-stateless)
+3. [What an Agent Is](#3-what-an-agent-is)
+4. [The Agent Loop](#4-the-agent-loop)
+5. [How Tool Calling Works](#5-how-tool-calling-works)
+6. [Why a Checklist Tool Works](#6-why-a-checklist-tool-works)
+
+**Part B: The Notebook, Code Block by Block**
+7. [Setup](#7-setup)
+8. [State: The Agent's External Memory](#8-state-the-agents-external-memory)
+9. [The Checklist Tools](#9-the-checklist-tools)
+10. [Testing Tools Manually](#10-testing-tools-manually)
+11. [Tool Schemas](#11-tool-schemas)
+12. [The Dispatcher](#12-the-dispatcher)
+13. [The Agent Loop (Code)](#13-the-agent-loop-code)
+14. [The Task and System Prompt](#14-the-task-and-system-prompt)
+15. [Running the Agent](#15-running-the-agent)
+
+**Part C: Depth**
+16. [Worked Example: The Train Problem](#16-worked-example-the-train-problem)
+17. [Weaknesses and Lessons](#17-weaknesses-and-lessons)
+18. [Improved Version](#18-improved-version)
+19. [Frameworks and Research](#19-frameworks-and-research)
+20. [Self-Assessment](#20-self-assessment)
+21. [Glossary](#21-glossary)
+22. [One-Page Summary](#22-one-page-summary)
+
+---
+
+# Part A: Theory
+
+## 1. What the Notebook Teaches
+
+The earlier Digital Twin notebook contained an agent loop, but it ran invisibly. This notebook makes it **visible and multi-step** by adding two ideas borrowed from Claude Code:
+
+| Idea | Problem it solves |
+|---|---|
+| **Checklist tool** | Makes the model plan a multi-step task and track progress, which produces many tool calls |
+| **Terminal UI (TUI)** | Lets a human watch the agent work step by step |
+
+**Core lesson:** an agent is not a special model. It is an ordinary LLM inside a **loop**, with **tools** and **state**. Planning and progress display are design layers on top.
+
+## 2. LLMs Are Stateless
+
+**Additional Explanation.** An LLM call is a function of its input only:
+
+$$\text{output} = f_\theta(\text{messages}, \text{tools})$$
+
+The model remembers nothing between calls. What feels like memory is the **message list resent every time**. Consequences:
+
+1. The history **is** the agent's short-term memory.
+2. Anything that must persist beyond the text (the checklist) lives **outside** the model, in your program.
+3. Cost grows with history, since every round resends everything.
+
+## 3. What an Agent Is
+
+**Textbook Insight.** In classical AI (Russell and Norvig), an agent perceives an environment and acts on it through a policy.
+
+| Classical concept | In this notebook |
+|---|---|
+| Policy | The LLM |
+| Observations | Tool results, user message |
+| Actions | Tool calls, final answer |
+| Actuators | Your Python functions |
+| State | Message list plus checklist |
+
+**The model decides; your code acts.** The LLM never runs anything. It only produces text requesting an action. This separation gives you control: you decide what actually executes.
+
+**Autonomy levels:** a single LLM call has no agency; a fixed pipeline is a *workflow*; an *agent* decides its own next step at runtime. This notebook is an agent: the model chooses when to plan, what to do next, and when it is finished.
+
+## 4. The Agent Loop
+
+The idea in pseudocode:
+
+```
+while the model asks for a tool:
+    run the requested tools
+    add the request and the results to the history
+    ask the model again
+print the final answer
+```
+
+Formally:
+
+$$a_t = \pi(h_t), \qquad o_{t+1} = \text{Env}(a_t), \qquad h_{t+1} = h_t \,\Vert\, (a_t, o_{t+1})$$
+
+($h_t$ history, $\pi$ the LLM, $a_t$ action or final answer, $o_{t+1}$ the observation.)
+
+**Termination:** the loop ends when the model replies with plain text instead of a tool request. The model itself decides it is done. That is both the power and the danger: autonomy requires safeguards, because nothing forces it to stop.
+
+**Why it matters:** a single call cannot react to new information; a loop can **act, observe, and adapt**. This is the difference between answering and doing.
+
+## 5. How Tool Calling Works
+
+**The model only emits requests.** It outputs a tool name and arguments as structured text. Nothing runs until your code reads that and executes the matching function.
+
+```
+Model → "call mark_complete with {index: 1, notes: ...}"   (just text)
+Code  → runs the function
+Code  → sends the result back
+Model → reads it and decides the next move
+```
+
+**History order rules**
+
+```
+system → user → assistant(tool requests) → tool(result per request) → assistant → ...
+```
+
+1. The assistant's tool-request message goes into history **before** the results.
+2. Each result carries the **id** of the request it answers.
+3. Results are **text** (structured data is serialized).
+
+Reason: the model is stateless, so the history must read like a coherent transcript: "I asked for X, X returned Y".
+
+**Parallel calls:** the model may request several tools in one turn; your code returns one result per request.
+
+**Schemas are documentation for the model.** The model never sees your functions, only their descriptions (name, purpose, parameters in JSON Schema). It picks tools and fills arguments from those words, so **wording matters**.
+
+**Additional Explanation.** *Strict* function calling uses **constrained decoding** to guarantee that arguments match the schema. Without it, the model usually, but not always, complies.
+
+## 6. Why a Checklist Tool Works
+
+**The problem:** an LLM spends a fixed amount of computation per token. A long multi-step task attempted at once invites skipped steps, lost intermediate results, and drift.
+
+| Mechanism | Explanation |
+|---|---|
+| **Decomposition** | Writing the plan breaks the problem into easier steps |
+| **External working memory** | The list lives in your program, not in the model's head |
+| **Recitation** | The plan is re-shown at the *end* of the context, where attention is strongest, reducing drift |
+| **Observable checkpoints** | Each completed step is a discrete event to watch, log or audit |
+| **Self-explanation** | Completion notes make the model state what it did, a light reflection step |
+
+**Where intermediate work is stored:** the notes are tool-call arguments, so they stay in the history and later steps can read earlier results. The checklist is both a plan and a trail of evidence.
+
+**Research Connection.**
+
+| Pattern | Idea | Link to notebook |
+|---|---|---|
+| **ReAct** (Yao et al., 2022) | Thought → Action → Observation | Notes ≈ thought; tool call ≈ action; updated checklist ≈ observation |
+| **Plan-and-Solve / Least-to-Most** | Decompose before solving | The initial checklist |
+| **Reflexion** (Shinn et al., 2023) | Reflect on what was done | Completion notes |
+| **Plan-and-Execute** | Fixed plan, then run | The notebook is a hybrid: plan first, but items can be appended later |
+
+| | Strength | Weakness |
+|---|---|---|
+| **ReAct** | Flexible | Can wander without global structure |
+| **Plan-and-Execute** | Clear structure | A wrong plan stays wrong without replanning |
+| **This notebook** | Structure plus some flexibility | Cannot edit or remove items |
+
+**Meta-tools.** Most tools act on the world; these act on the agent's **own plan**. The idea: give the agent tools for *thinking and organizing*, not only acting. Claude Code's todo list exists for the same reasons.
+
+---
+
+# Part B: The Notebook, Code Block by Block
+
+## 7. Setup
+
+```python
+# Start with some imports - rich is a library for making formatted text output in the terminal
+
+from rich.console import Console
+from dotenv import load_dotenv
+from openai import OpenAI
+import json
+load_dotenv(override=True)
+```
+
+**Idea:** assemble three capabilities: a **terminal formatter** (Rich, for the TUI), **secure access to the API key** (loaded from a `.env` file instead of hard-coded, so secrets stay out of code), and the **model client**. `json` is needed because tool arguments and results travel as JSON text.
+
+```python
+def show(text):
+    try:
+        Console().print(text)
+    except Exception:
+        print(text)
+```
+
+**Idea: defensive output.** The model writes markup that the terminal interprets. Model output is untrusted, so malformed markup could crash the program mid-run. The fallback to plain printing keeps the agent alive. General principle: **anything the model generates and your program interprets must be handled defensively.**
+
+```python
+openai = OpenAI()
+```
+
+**Idea:** create the client that talks to the model API.
+
+## 8. State: The Agent's External Memory
+
+```python
+# Some lists!
+
+checklist = []
+completed = []
+```
+
+**Idea:** because the model is stateless, the plan must live **outside** it. These two lists are the agent's **working memory** (scratchpad): one holds the step descriptions, the other whether each is done. They persist across tool calls regardless of what the conversation text says.
+
+**Design note:** two parallel lists must be kept aligned by hand, which is fragile. A single list of item objects is safer (see §18).
+
+## 9. The Checklist Tools
+
+```python
+def get_checklist_report() -> str:
+    result = ""
+    for index, item in enumerate(checklist):
+        if completed[index]:
+            result += f"Checklist #{index + 1}: [green][strike]{item}[/strike][/green]\n"
+        else:
+            result += f"Checklist #{index + 1}: {item}\n"
+    show(result)
+    return result
+```
+
+**Idea: one output, two audiences.** The function **prints** the list for the human (completed items green and struck through, the visual heart of the TUI) and **returns** the same text to the model. The model therefore sees the full current plan after every change, which **re-anchors** it on where it is (recitation, §6).
+
+**Why it matters:** the tool performs the displaying itself. The loop prints almost nothing; the TUI arises from the **tools' side effects**. Lesson: build observability into the *actions*, not bolted on afterwards.
+
+**Subtle cost:** the model receives display markup too, which is token noise. A cleaner design returns plain text to the model and styled text to the human.
+
+```python
+def create_checklist(descriptions: list[str]) -> str:
+    checklist.extend(descriptions)
+    completed.extend([False] * len(descriptions))
+    return get_checklist_report()
+```
+
+**Idea: planning as an action.** This is how the model **commits to a plan**. It accepts many steps in one call, marks them all not-done, and returns the whole list. Calling it again **adds** more items rather than replacing, which lets the agent extend its plan mid-task but never remove or fix a step.
+
+```python
+def mark_complete(index: int, completion_notes: str) -> str:
+    if 1 <= index <= len(checklist):
+        completed[index - 1] = True
+    else:
+        return "No checklist at this index."
+    Console().print(completion_notes)
+    return get_checklist_report()
+```
+
+**Idea: progress tracking with evidence.** Three design choices carry the lessons:
+
+1. **Errors are returned as text, not raised.** A bad index produces a message the model can read and correct. The loop is a feedback system; a crash would remove the model's chance to recover.
+2. **`completion_notes` forces the model to show its work.** The note is printed for the human and stays in the history as a tool argument, so it is also **where intermediate results are stored** for later steps.
+3. **Humans count from 1.** The interface uses 1-based positions (matching what the user sees), and the schema says so explicitly to prevent off-by-one errors.
+
+## 10. Testing Tools Manually
+
+```python
+get_checklist_report()
+```
+
+```python
+checklist, completed = [], []
+
+create_checklist(["Buy groceries", "Finish week 1", "Eat banana"])
+```
+
+```python
+mark_complete(1, "bought")
+```
+
+**Idea: debug the deterministic part before adding the probabilistic part.** If a tool is faulty, the model will behave confusingly in ways that are hard to diagnose. Calling tools by hand first confirms they work. You see an empty report, then three pending items, then item 1 struck through. Resetting the lists before runs matters because the tools **append**.
+
+## 11. Tool Schemas
+
+```python
+create_checklist_json = {
+    "name": "create_checklist",
+    "description": "Add new checklist from a list of descriptions and return the full list",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "descriptions": {
+                'type': 'array',
+                'items': {'type': 'string'},
+                'title': 'Descriptions of checklist items'
+                }
+            },
+        "required": ["descriptions"],
+        "additionalProperties": False
+    }
+}
+```
+
+```python
+mark_complete_json = {
+    "name": "mark_complete",
+    "description": "Mark complete the checklist item at the given position (starting from 1) and return the full list",
+    "parameters": {
+        'properties': {
+            'index': {
+                'description': 'The 1-based index of the checklist item to mark as complete',
+                'title': 'Index',
+                'type': 'integer'
+                },
+            'completion_notes': {
+                'description': 'Notes about how you completed the checklist item in rich console markup',
+                'title': 'Completion Notes',
+                'type': 'string'
+                }
+            },
+        'required': ['index', 'completion_notes'],
+        'type': 'object',
+        'additionalProperties': False
+    }
+}
+```
+
+```python
+tools = [{"type": "function", "function": create_checklist_json},
+        {"type": "function", "function": mark_complete_json}]
+```
+
+**Idea: the schema is the model's only view of your tool.** It tells the model **what the tool is for** (description), **what it needs** (parameters and required), and **what it must not do** (no extra arguments). Key points:
+
+- The **name must match** the real function exactly, because that is how the request gets routed to code.
+- Descriptions are written **for the model**. "Starting from 1" and "1-based" prevent off-by-one mistakes; "in rich console markup" steers output toward what the UI can render.
+- "No additional properties" plus "required" fields are the conditions for **strict mode**, which guarantees well-formed arguments through constrained decoding.
+- The `title` fields come from auto-generated schemas (typical of Pydantic) and carry little meaning.
+- The final list wraps each schema in the envelope the API expects; this is the **menu of tools** the model may choose from.
+
+## 12. The Dispatcher
+
+```python
+def handle_tool_calls(tool_calls):
+    results = []
+    for tool_call in tool_calls:
+        tool_name = tool_call.function.name
+        arguments = json.loads(tool_call.function.arguments)
+        tool = globals().get(tool_name)
+        result = tool(**arguments) if tool else {}
+        results.append({"role": "tool","content": json.dumps(result),"tool_call_id": tool_call.id})
+    return results
+```
+
+**Idea: the bridge from model text to real action.** This is the **actuator layer** (§3). For each request the model made, it does four things conceptually:
+
+1. **Reads** the tool name and the arguments the model supplied.
+2. **Finds** the matching function by name (dynamic dispatch: the program chooses what to run at runtime).
+3. **Runs** it with those arguments.
+4. **Packages** the result as a tool message tied to the request's id, so the model can match answer to question.
+
+It handles a **list** of calls because the model may request several at once (parallel tool calls), and it returns one result per request.
+
+**Where the design is weak** (all discussed in §17):
+
+- Looking tools up by name from **everything defined in the program** means the model could, in principle, trigger functions you never meant to expose. The safer pattern is an explicit **allow-list** (principle of least privilege; related to prompt-injection risk).
+- An unknown tool silently returns an empty result, so the model cannot tell that its request failed.
+- There is **no error handling**: one bad argument stops the whole run.
+
+## 13. The Agent Loop (Code)
+
+```python
+def loop(messages):
+    response = openai.chat.completions.create(model="gpt-5.5", messages=messages, tools=tools)
+    while response.choices[0].finish_reason == "tool_calls":
+        message = response.choices[0].message
+        tool_calls = message.tool_calls
+        results = handle_tool_calls(tool_calls)
+        messages.append(message)
+        messages.extend(results)
+        response = openai.chat.completions.create(model="gpt-5.5", messages=messages, tools=tools)
+    show(response.choices[0].message.content)
+```
+
+**Idea: this is the agent.** Everything else exists to support these lines. Step by step in concepts:
+
+1. **Ask the model** with the history and the tool menu.
+2. **Check why it stopped.** A "tool calls" stop reason means *the model wants something done*; any other reason means it has produced a final answer.
+3. If it wants tools: **run them**, then **append the model's request and the results** to the history in the order the protocol requires (§5).
+4. **Ask again** with the longer history. The model now sees what happened and chooses its next move.
+5. When it stops requesting tools, **print the final answer**.
+
+**Observations**
+
+- The history is **mutated** as the loop runs, so afterwards it contains the entire transcript, which is useful for inspection or continuing the conversation.
+- Only the final answer is printed here. The **progress display** comes from the tools themselves (§9), so the loop stays small and generic.
+- There is **no step limit and no check that the plan was finished** (see §17).
+
+## 14. The Task and System Prompt
+
+```python
+system_message = """
+You are given a problem to solve, by using your checklist tools to plan a list of steps, then carrying out each step in turn.
+Now create a plan, set the checklist, carry out the steps, and reply with the solution.
+If any quantity isn't provided in the question, then include a step to come up with a reasonable estimate.
+Provide your solution in Rich console markup without code blocks.
+Do not ask the user questions or clarification; respond only with the answer after using your tools.
+"""
+user_message = """"
+A train leaves Boston at 2:00 pm traveling 60 mph.
+Another train leaves New York at 3:00 pm traveling 80 mph toward Boston.
+When do they meet?
+"""
+messages = [{"role": "system", "content": system_message}, {"role": "user", "content": user_message}]
+```
+
+**Idea: the system prompt is the agent's policy.** Each instruction has a purpose:
+
+| Instruction | Effect | Concept |
+|---|---|---|
+| Use checklist tools to plan, then carry out each step | Forces plan-then-execute | Task decomposition |
+| Create a plan, set the checklist, carry out the steps, then reply | Fixes the order of actions | Procedural control |
+| If a quantity is missing, add a step to estimate it | Handles underspecified problems | Assumption making |
+| Reply in Rich console markup | Matches output to the UI | Output format control |
+| Do not ask the user questions | Prevents early termination | Autonomy |
+
+**"Do not ask questions" is a loop-control instruction.** A clarifying question is just a text reply, and a text reply **ends the loop**. In an unattended agent, asking equals stopping. The prompt decides whether the agent should guess or ask.
+
+**Why this problem?** The Boston–New York distance is missing, so the task is **underspecified** like real tasks. It forces an estimation step and explicit assumptions. The math is deliberately small so the *process* (plan, track, finish) is easy to follow.
+
+A small typo: the user message opens with four quote marks, so it begins with a stray quote character. Harmless, but a slip.
+
+## 15. Running the Agent
+
+```python
+checklist, completed = [], []
+loop(messages)
+```
+
+**Idea:** reset the state, then run. Resetting matters because the state is global and tools append, so leftovers from earlier runs would contaminate the plan. You then watch the list appear, items get struck through in green one by one, and the final answer print.
+
+**The exercise at the end of the notebook** asks you to rebuild an agent loop from scratch. What you are practicing: (1) a tool with a schema, (2) a dispatcher, (3) the loop with correct message ordering, (4) a termination condition. If you can do these four from memory, you understand the core of every agent framework.
+
+---
+
+# Part C: Depth
+
+## 16. Worked Example: The Train Problem
+
+**Concept: relative motion with a head start.**
+
+1. Estimate the missing distance $D$ (say 215 miles).
+2. By 3:00 pm Train A has covered 60 miles.
+3. Remaining gap: $D - 60 = 155$ miles.
+4. Closing speed: $60 + 80 = 140$ mph.
+5. Time to meet after 3:00 pm: $155/140 \approx 1.107$ h ≈ 66 min.
+
+**Answer:** about **4:06 pm**, roughly 126 miles from Boston.
+
+General formula (hours after 2:00 pm):
+
+$$t = \frac{D + 80}{140}$$
+
+The answer depends on the estimate of $D$, so the agent should state its assumption.
+
+**What a typical run looks like**
+
+| Round | Action | Result |
+|---|---|---|
+| 1 | Create checklist (estimate distance, head start, closing speed, meeting time, clock time) | Full list, all pending |
+| 2 to 6 | Mark items complete with notes, possibly several in parallel | List updates, struck through |
+| 7 | Final text answer | Loop ends |
+
+**History growth:** it starts at 2 messages (system, user) and each round adds the assistant request plus one result per tool call. With one call per round, after 3 rounds there are 2 + 3×2 = 8 messages.
+
+**Cost growth.** The whole history is resent each round, so cumulative input grows roughly quadratically in the number of rounds $R$:
+
+$$\text{total input} \approx R\,T_0 + \bar{t}\,\frac{R(R+1)}{2}$$
+
+($T_0$ initial prompt size, $\bar t$ tokens added per round.) Remedies: prompt caching, shortening old tool outputs, summarizing history, delegating sub-tasks to fresh contexts.
+
+## 17. Weaknesses and Lessons
+
+Each flaw in the notebook is a lesson in agent engineering.
+
+| Weakness | Why it matters | Lesson |
+|---|---|---|
+| No step limit | A runaway agent can burn money indefinitely | *Bound autonomy*: always cap iterations |
+| Unknown tool returns silently empty | The model cannot tell its request failed | *Failures must be visible to the model* |
+| Tools looked up from everything defined in the program | The model could trigger unintended functions | *Least privilege*: explicit allow-list |
+| No error handling around tool execution | One bad argument crashes the run | *Errors are observations, not crashes* |
+| Model receives display markup | Wastes tokens, adds noise | *Format for each audience separately* |
+| Cannot edit or remove items | A flawed plan can only be appended to | *Give agents ways to replan* |
+| No check that all items are done before answering | The model may answer early | *Add verification gates* |
+| Mixed printing paths | The note printer lacks the fallback | *Use one safe output path* |
+| Global mutable state | Runs contaminate each other, not reusable | *Encapsulate state* |
+| Only one stop reason handled | Truncated or filtered replies are mishandled | *Handle every termination case* |
+| Stray quote in the user message | Minor | *Read your own prompts* |
+
+**Prompt injection.** **Research Connection.** If an agent reads untrusted content (web pages, documents), that content may contain instructions trying to steer it into harmful tool use. Defenses: allow-lists, human approval for risky actions, argument validation, sandboxing, and treating tool output as *data*, never as instructions.
+
+## 18. Improved Version
+
+This is the notebook's design with the §17 fixes applied. It is included because the *changes*, not the syntax, are the lesson.
+
+```python
+import json
+from dataclasses import dataclass, field
+from rich.console import Console
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv(override=True)
+client = OpenAI()
+console = Console()
+MODEL = "gpt-5.5"
+MAX_STEPS = 25                     # bounded autonomy
+
+
+@dataclass
+class Item:
+    text: str
+    done: bool = False
+    notes: str = ""
+
+@dataclass
+class Checklist:
+    items: list[Item] = field(default_factory=list)
+
+    def render_for_model(self) -> str:        # plain text for the model
+        if not self.items:
+            return "Checklist is empty."
+        return "\n".join(f"{i}. [{'x' if it.done else ' '}] {it.text}"
+                         for i, it in enumerate(self.items, start=1))
+
+    def render_for_human(self) -> str:        # styled text for the human
+        return "\n".join(
+            f"#{i}: [green][strike]{it.text}[/strike][/green]" if it.done else f"#{i}: {it.text}"
+            for i, it in enumerate(self.items, start=1))
+
+    def show(self):
+        try:
+            console.print(self.render_for_human())
+        except Exception:
+            print(self.render_for_human())
+
+state = Checklist()
+
+
+def create_checklist(descriptions: list[str]) -> str:
+    state.items.extend(Item(d) for d in descriptions)
+    state.show()
+    return state.render_for_model()
+
+def mark_complete(index: int, completion_notes: str) -> str:
+    if not (1 <= index <= len(state.items)):
+        return f"Error: index must be between 1 and {len(state.items)}."
+    item = state.items[index - 1]
+    if item.done:
+        return f"Item {index} is already complete.\n{state.render_for_model()}"
+    item.done, item.notes = True, completion_notes
+    try:
+        console.print(completion_notes)
+    except Exception:
+        print(completion_notes)
+    state.show()
+    return state.render_for_model()
+
+TOOL_REGISTRY = {                           # explicit allow-list
+    "create_checklist": create_checklist,
+    "mark_complete": mark_complete,
+}
+
+
+def dispatch(tool_call) -> dict:
+    name = tool_call.function.name
+    fn = TOOL_REGISTRY.get(name)
+    if fn is None:
+        content = f"Error: unknown tool '{name}'. Available: {list(TOOL_REGISTRY)}"
+    else:
+        try:
+            content = fn(**json.loads(tool_call.function.arguments))
+        except Exception as e:              # errors become observations
+            content = f"Error while running {name}: {type(e).__name__}: {e}"
+    return {"role": "tool", "tool_call_id": tool_call.id, "content": str(content)}
+
+
+def loop(messages: list, tools: list) -> str:
+    for step in range(MAX_STEPS):
+        response = client.chat.completions.create(model=MODEL, messages=messages, tools=tools)
+        choice = response.choices[0]
+        message = choice.message
+        messages.append(message)
+
+        if choice.finish_reason == "tool_calls":
+            messages.extend(dispatch(tc) for tc in message.tool_calls)
+            continue
+
+        if choice.finish_reason == "stop":
+            if state.items and not all(it.done for it in state.items):   # verification gate
+                messages.append({"role": "user",
+                                 "content": "Some checklist items are not complete. Finish them first."})
+                continue
+            return message.content
+        return f"Stopped early: finish_reason={choice.finish_reason}"
+    return "Stopped: maximum steps reached."
+```
+
+| Change | Principle |
+|---|---|
+| Explicit tool registry | Least privilege |
+| Errors returned as text | Closed feedback loop |
+| Step cap | Bounded autonomy |
+| Separate model and human rendering | Different audiences, different formats |
+| Item objects instead of parallel lists | No desynchronization |
+| Completion check before accepting an answer | Verification gate |
+| All stop reasons handled | Robustness |
+| Notes stored per item | Auditability |
+
+## 19. Frameworks and Research
+
+| Framework | How the loop appears |
+|---|---|
+| OpenAI Agents SDK | A runner repeats model call, tool execution, handoff until final output |
+| LangChain / LangGraph | An agent node and a tools node in a cycle, with a conditional edge: "did the model request tools?" |
+| LlamaIndex | An agent runner stepping through tasks |
+| AutoGen | Agents exchange messages and execute function calls |
+| MCP | Standardizes how tools are described and served, so schema-and-dispatch plumbing becomes generic |
+| Anthropic API | Same pattern with different names (tool-use and tool-result blocks) |
+
+| Notebook part | Framework concept |
+|---|---|
+| Tool schemas | Tool definitions (often auto-generated from type hints) |
+| Dispatcher | Tool executor / tool node |
+| `loop` | Agent runtime / orchestration |
+| `checklist`, `completed` | Agent state (LangGraph "state") |
+| System prompt | Agent instructions |
+
+**Takeaway:** frameworks package this loop plus state management, tracing and retries. Knowing the bare loop lets you debug any of them.
+
+**Natural extensions:** hierarchical planning (sub-checklists), multi-agent systems (planner owns the list, workers execute items), persistent memory (plan stored in a database), trajectory evaluation (success rate, steps, tool-error rate, cost), and real-world tools (search, RAG, code execution, APIs). Observability tools such as LangSmith, Langfuse and OpenTelemetry tracing generalize the notebook's TUI.
+
+## 20. Self-Assessment
+
+**Questions**
+
+1. Why must the full message history be resent on every call?
+2. What does "the model decides, your code acts" mean, and why is it valuable?
+3. What ends the agent loop, and why is that a risk?
+4. Why is the tool schema "documentation for the model"? Give an example from the notebook.
+5. Why return tool errors as text instead of raising them?
+6. Name three reasons a checklist improves multi-step performance.
+7. Why does the system prompt forbid asking the user questions?
+8. Why do the checklist tools return the entire list each time?
+9. Map the notebook's loop onto ReAct.
+10. Why does token cost grow faster than linearly with rounds?
+11. What is least privilege for tools, and which notebook choice violates it?
+12. Why is the train problem deliberately underspecified?
+13. What is a meta-tool? Give the notebook's example.
+14. Why do the tools print progress instead of the loop?
+15. After 3 rounds with one tool call each, how many messages are in the history?
+
+**Answer key**
+
+1. The model is stateless; the history is its only memory.
+2. The model only emits text requesting actions; your code chooses what runs, so you can validate, restrict or refuse any action.
+3. The model replying with plain text. Nothing forces it to stop (runaway cost) or to finish properly (premature answer), so you need step caps and completion checks.
+4. The model never sees your code, only the schema. "1-based index" prevents the model from sending 0.
+5. The loop is a feedback system; the model can only recover if it learns about the mistake. A crash removes that chance.
+6. Any three of: decomposition, external working memory, recitation, observable checkpoints, self-explanation.
+7. A question is a text reply, which ends the loop; the prompt forces assumptions and completion.
+8. To re-anchor the model on the plan and progress every round.
+9. Thought ≈ plan and notes; Action ≈ tool call; Observation ≈ updated checklist.
+10. Each round resends all earlier messages plus new ones, so cumulative input grows like $R^2$.
+11. Give the agent only the tools it needs. Looking tools up by name from everything defined in the program violates this; use an explicit allow-list.
+12. It forces an estimation step and explicit assumptions, mirroring real tasks.
+13. A tool that manages the agent's own planning: the checklist tools.
+14. Observability is built into the actions, so the UI appears automatically as a side effect of what the agent does, and the loop stays small and generic.
+15. 8 (2 initial + 2 per round × 3).
+
+## 21. Glossary
+
+| Term | Meaning |
+|---|---|
+| **Agent** | An LLM in a loop that decides actions, observes results, and continues until done |
+| **Agent loop** | Call model → run requested tools → append results → call again |
+| **Stateless** | The model keeps no memory between calls; history is resent |
+| **Tool / function calling** | The model emits a structured request; your code executes it |
+| **Tool schema** | Description of a tool's name, purpose and parameters, read by the model |
+| **Dispatcher** | Code that matches a requested tool name to a real function and runs it |
+| **Meta-tool** | A tool that manages the agent's own planning or state |
+| **Working memory / scratchpad** | State kept outside the model and consulted between steps |
+| **Recitation** | Restating the plan near the end of context to keep focus |
+| **TUI** | Terminal user interface |
+| **Observability** | Being able to see what the agent is doing and why |
+| **ReAct** | Reasoning and acting interleaved |
+| **Plan-and-Execute** | Plan first, then carry out |
+| **Trajectory** | The full sequence of messages, tool calls and results for one run |
+| **Prompt injection** | Untrusted content that tries to steer the model |
+| **Least privilege** | Give the agent only the tools it needs |
+| **Strict mode** | Constrained decoding guaranteeing arguments match the schema |
+| **Closed feedback loop** | Results and errors flow back so the model can adapt |
+| **Parallel tool calls** | Several tool requests in one model turn |
+
+## 22. One-Page Summary
+
+1. **LLMs are stateless.** The message list is memory; anything persistent lives outside.
+2. **An agent = LLM + tools + loop + state.** The model decides, your code acts.
+3. **The loop** continues while the model requests tools and stops when it replies with text. Autonomy needs safeguards.
+4. **Tool calling** is structured text. History order: assistant request, then tool results with matching ids.
+5. **Schemas are documentation for the model.** Precise wording prevents errors.
+6. **Good tools** return errors as text, return full state, serve both human and model, and are tested manually first.
+7. **A checklist** gives decomposition, external memory, recitation, checkpoints and self-explanation.
+8. **The TUI** works because tools display their own progress.
+9. **The system prompt is policy**, including whether the loop ends early.
+10. **Weaknesses** (no step cap, unsafe dispatch, no error handling, no verification) teach: bound autonomy, least privilege, errors as observations, verify before finishing.
+11. **Cost** grows roughly quadratically with rounds.
+12. **Frameworks** package the same loop; knowing it lets you debug any of them.
 9. Modules: `context.py` (prompt), `tools.py` (tools), `app.py` (UI + loop); run with `uv run app.py`; use `pathlib` paths.
 10. Deploy with secrets as env vars (never in git), bind `0.0.0.0`, expect cold starts and ephemeral disks; persist leads to a database, add rate limits and spending caps.
 
